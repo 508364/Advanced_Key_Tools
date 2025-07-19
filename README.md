@@ -62,7 +62,7 @@ python key_generator.py
 | `key.pem`  | PEM 格式（Base64）   | 存储 RSA 公钥                        |
 | `key.key`  | PKCS#8 格式（Base64）| 存储 RSA 私钥                        |
 
-## ⚠️ 安全警告
+## ⚠️ 安全警告(仅供参考)
 
  1.  **🔐 密钥保管责任**
    **生成的密钥等同于银行金库钥匙，丢失或泄露将导致安全系统崩溃**
