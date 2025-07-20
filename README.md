@@ -1,6 +1,6 @@
 # Advanced_Key_Tools
 
-[查看其它GUI版本?](./Directory.md)
+[***查看其它GUI版本***](./Directory.md)
 
 **请勿用于非法用途**  
 **严禁将此系统用于非法活动或未经授权的目的**
