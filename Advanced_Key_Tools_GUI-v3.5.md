@@ -203,7 +203,7 @@ https://afdian.net/a/50_83_64
 
 ## ⚖️ 开源许可
 本项目采用 **MIT License**：
-***[全文详见LICENSE文件]***
+***[全文详见LICENSE文件]***(https://github.com/508364/Advanced_Key_Tools/blob/main/LICENSE)
 
 <font color="RED">**最终声明**：用户应确保使用方式符合所有适用法律，开发者对任何非法用途不承担责任</font>
 #### <font color="RED">**软件不会传输您的设备数据，如果有其它软件需要使用该软件/代码则应遵循此规则**</font>
