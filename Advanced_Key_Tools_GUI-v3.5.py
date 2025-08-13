@@ -1,0 +1,1909 @@
+"""
+高级密钥工具 GUI v3.5
+增强的密钥生成、RSA加密和图种制作工具
+"""
+
+import os
+import sys
+import time
+import uuid
+import psutil
+import hashlib
+import secrets
+import binascii
+import logging
+import threading
+import struct
+import zipfile
+import shutil
+import tempfile
+import subprocess
+import json
+import base64
+import io
+import argparse
+from typing import Optional, Tuple, Dict, Any
+from dataclasses import dataclass
+from enum import Enum
+
+from Crypto.PublicKey import RSA
+from Crypto.Cipher import PKCS1_OAEP, AES
+from Crypto.Random import get_random_bytes
+from PIL import Image, ImageQt
+
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QTabWidget, QWidget, QVBoxLayout, QHBoxLayout,
+    QPushButton, QTextEdit, QLineEdit, QLabel, QFileDialog, QGroupBox,
+    QScrollArea, QMessageBox, QSizePolicy, QProgressBar, QCheckBox,
+    QGridLayout, QComboBox, QSplitter, QFrame, QStatusBar, QMenuBar, QMenu,
+    QAction, QToolBar, QToolButton, QInputDialog, QTableWidget, QTableWidgetItem,
+    QHeaderView, QStyle, QStackedWidget, QListWidget, QListWidgetItem,
+    QTreeWidget, QTreeWidgetItem
+)
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QSettings, QUrl, QSize
+from PyQt5.QtGui import QPixmap, QImage, QFont, QIcon, QPalette, QColor, QDesktopServices
+
+# Flask相关导入
+try:
+    from flask import Flask, request, jsonify
+    FLASK_AVAILABLE = True
+except ImportError:
+    FLASK_AVAILABLE = False
+    print("Flask未安装，API服务不可用")
+
+# 配置日志
+logging.basicConfig(
+    filename='key_tool_v3.5.log',
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+
+# 自定义符号集
+SYMBOLS = r"""!@#$%^&*()_+~`-=[];'\,./{}:"|<>?"""
+
+# API配置
+API_CONFIG = {}
+
+# 密钥类型枚举
+class KeyType(Enum):
+    SYMMETRIC = "symmetric"
+    RSA_PUBLIC = "rsa_public"
+    RSA_PRIVATE = "rsa_private"
+    COMPOSITE = "composite"
+
+# 密钥信息数据类
+@dataclass
+class KeyInfo:
+    key_id: str
+    formatted_key: str
+    hex_key: str
+    public_key: str
+    private_key: str
+    creation_time: str
+    entropy_sources: Dict[str, Any]
+
+
+class KeyLogger:
+    """增强的密钥生成日志记录器"""
+    def __init__(self):
+        self.log = {}
+        self.counter = 1
+    
+    def add(self, name: str, value: Any) -> Any:
+        """添加密钥记录"""
+        self.log[f"{self.counter:02d}_{name}"] = value
+        self.counter += 1
+        return value
+    
+    def hexify(self, data: bytes) -> str:
+        """转换为十六进制表示"""
+        return binascii.hexlify(data).decode()
+    
+    def display(self) -> str:
+        """显示所有记录的密钥"""
+        log_text = ""
+        for name, value in self.log.items():
+            step_id = name.split("_")[0]
+            step_name = name.split("_", 1)[1]
+            if isinstance(value, bytes):
+                value_str = f"{self.hexify(value[:8])}...{self.hexify(value[-8:])}"
+            elif isinstance(value, tuple):
+                value_str = f"公钥:\n{value[0]}\n\n私钥:\n{value[1]}"
+            else:
+                value_str = str(value)
+                
+            log_text += f"[Step {step_id}] {step_name:14} : {value_str}\n"
+        return log_text
+
+
+class EnhancedKeyGeneratorThread(QThread):
+    """增强的密钥生成线程"""
+    progress = pyqtSignal(int, str)
+    completed = pyqtSignal(KeyInfo)
+    error = pyqtSignal(str)
+    
+    def __init__(self):
+        super().__init__()
+    
+    def run(self):
+        """执行密钥生成过程"""
+        try:
+            # 1. 收集熵源
+            self.progress.emit(10, "收集系统熵源...")
+            entropy = self.generate_entropy()
+            
+            # 2. 创建密钥记录器
+            logger = KeyLogger()
+            logger.add("原始熵源", entropy)
+            
+            # 3. 密钥派生链
+            self.progress.emit(30, "执行一级密钥派生 (SHA512)...")
+            k1, salt1 = self.derive_key(entropy, None, logger=logger, dklen=64)
+            
+            self.progress.emit(45, "执行二级密钥派生 (SHA3-512)...")
+            k2, salt2 = self.derive_key(k1, salt1, logger=logger, algo='sha3_512', dklen=64)
+            
+            self.progress.emit(60, "执行三级密钥派生 (BLAKE2s)...")
+            k3, salt3 = self.derive_key(k2, salt2, logger=logger, algo='blake2s', dklen=64)
+            
+            # 4. 生成RSA密钥对
+            self.progress.emit(75, "生成RSA-4096密钥对...")
+            rsa_seed = k3[:32]  # 使用前256位作为种子
+            public_key, private_key = self.generate_rsa_keypair(rsa_seed, key_size=4096)
+            logger.add("RSA_4096密钥对", (public_key, private_key))
+            
+            # 5. 创建密钥ID
+            hex_key = binascii.hexlify(k3).decode()
+            key_id = f"KEY-{time.strftime('%Y%m%d-%H%M%S')}-{hex_key[:8].upper()}"
+            
+            # 6. 格式化密钥
+            self.progress.emit(90, "格式化密钥...")
+            formatted_key = self.format_key(hex_key)
+            
+            # 7. 创建密钥信息对象
+            key_info = KeyInfo(
+                key_id=key_id,
+                formatted_key=formatted_key,
+                hex_key=hex_key,
+                public_key=public_key,
+                private_key=private_key,
+                creation_time=time.strftime('%Y-%m-%d %H:%M:%S'),
+                entropy_sources=logger.log
+            )
+            
+            # 8. 完成并发送结果
+            self.progress.emit(100, "密钥生成完成!")
+            self.completed.emit(key_info)
+            
+        except Exception as e:
+            logging.exception("密钥生成失败!")
+            self.error.emit(str(e))
+    
+    def collect_network_data(self, duration: int = 10) -> Tuple[list, threading.Thread]:
+        """收集网络数据"""
+        def _collect(result):
+            try:
+                initial = psutil.net_io_counters()
+                time.sleep(duration)
+                final = psutil.net_io_counters()
+                net_data = struct.pack(
+                    'QQQQQQQQQ',
+                    final.bytes_recv - initial.bytes_recv,
+                    final.bytes_sent - initial.bytes_sent,
+                    final.packets_recv - initial.packets_recv,
+                    final.packets_sent - initial.packets_sent,
+                    time.perf_counter_ns(),
+                    os.getpid(),
+                    os.getppid(),
+                    len(threading.enumerate()),
+                    time.monotonic_ns()
+                )
+                result.append(net_data)
+            except Exception as e:
+                logging.error(f"网络数据收集失败: {e}")
+                result.append(os.urandom(64))
+
+        result = []
+        thread = threading.Thread(target=_collect, args=(result,))
+        thread.start()
+        return result, thread
+    
+    def generate_entropy(self) -> bytes:
+        """生成熵源数据"""
+        # 1. 启动网络数据收集线程
+        net_result, net_thread = self.collect_network_data()
+        
+        # 2. 主线程生成其他熵源
+        timestamp = struct.pack('d', time.time())
+        uuids = [uuid.UUID(bytes=os.urandom(16), version=4) for _ in range(10)]
+        uuids_bytes = b''.join(u.bytes for u in uuids)
+        randoms = [os.urandom(8) for _ in range(10)]
+        
+        # 3. 等待网络线程完成
+        net_thread.join()
+        net_data = net_result[0]
+        
+        # 4. 组合所有熵源
+        entropy = timestamp + uuids_bytes + net_data + b''.join(randoms)
+        return entropy
+    
+    def derive_key(self, seed: bytes, prev_salt: Optional[bytes], iterations: int = 200000, 
+                   dklen: int = 64, algo: str = 'sha512', logger: Optional[KeyLogger] = None) -> Tuple[bytes, bytes]:
+        """派生密钥"""
+        new_salt = hashlib.shake_128(prev_salt + seed).digest(32) if prev_salt else os.urandom(32)
+        derived = hashlib.pbkdf2_hmac(
+            algo, 
+            seed, 
+            new_salt, 
+            iterations, 
+            dklen=dklen
+        )
+        if logger:
+            logger.add(f"PBKDF2-HMAC-{algo}", derived)
+            logger.add(f"SALT_{algo}", new_salt)
+        return derived, new_salt
+    
+    def generate_rsa_keypair(self, seed: bytes, key_size: int = 4096) -> Tuple[str, str]:
+        """生成RSA密钥对"""
+        class SeedRandom:
+            def __init__(self, seed):
+                self.position = 0
+                self.seed = seed
+                
+            def __call__(self, size):
+                result = b""
+                while len(result) < size:
+                    start = self.position % len(self.seed)
+                    end = min(len(self.seed), start + size - len(result))
+                    result += self.seed[start:end]
+                    self.position = end
+                    if self.position >= len(self.seed):
+                        self.seed = hashlib.sha256(self.seed).digest()
+                        self.position = 0
+                return result
+        
+        rsa_gen = RSA.generate(key_size, randfunc=SeedRandom(seed))
+        private_key = rsa_gen.export_key().decode()
+        public_key = rsa_gen.publickey().export_key().decode()
+        
+        return public_key, private_key
+    
+    def format_key(self, hex_key: str) -> str:
+        """格式化密钥"""
+        # 使用更复杂的分组和分隔符策略
+        group_sizes = [4, 5, 6, 7, 8, 9, 10]
+        group_size = secrets.choice(group_sizes)
+        groups = [hex_key[i:i+group_size] for i in range(0, len(hex_key), group_size)]
+        
+        # 为每个分组选择不同的分隔符
+        separators = [secrets.choice(SYMBOLS) for _ in groups[1:]]
+        
+        formatted = groups[0]
+        for i, sep in enumerate(separators, 1):
+            formatted += sep + groups[i]
+        return formatted
+    
+    def generate_key_sync(self) -> Optional[KeyInfo]:
+        """同步生成密钥"""
+        try:
+            # 1. 收集熵源
+            entropy = self.generate_entropy()
+            
+            # 2. 创建密钥记录器
+            logger = KeyLogger()
+            logger.add("原始熵源", entropy)
+            
+            # 3. 密钥派生链
+            k1, salt1 = self.derive_key(entropy, None, logger=logger, dklen=64)
+            k2, salt2 = self.derive_key(k1, salt1, logger=logger, algo='sha3_512', dklen=64)
+            k3, salt3 = self.derive_key(k2, salt2, logger=logger, algo='blake2s', dklen=64)
+            
+            # 4. 生成RSA密钥对
+            rsa_seed = k3[:32]  # 使用前256位作为种子
+            public_key, private_key = self.generate_rsa_keypair(rsa_seed, key_size=4096)
+            logger.add("RSA_4096密钥对", (public_key, private_key))
+            
+            # 5. 创建密钥ID
+            hex_key = binascii.hexlify(k3).decode()
+            key_id = f"KEY-{time.strftime('%Y%m%d-%H%M%S')}-{hex_key[:8].upper()}"
+            
+            # 6. 格式化密钥
+            formatted_key = self.format_key(hex_key)
+            
+            # 7. 创建密钥信息对象
+            key_info = KeyInfo(
+                key_id=key_id,
+                formatted_key=formatted_key,
+                hex_key=hex_key,
+                public_key=public_key,
+                private_key=private_key,
+                creation_time=time.strftime('%Y-%m-%d %H:%M:%S'),
+                entropy_sources=logger.log
+            )
+            
+            return key_info
+            
+        except Exception as e:
+            logging.exception("同步密钥生成失败!")
+            return None
+
+
+class AdvancedKeyToolsGUI(QMainWindow):
+    """高级密钥工具GUI v3.5"""
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("高级密钥工具 v3.5")
+        self.setGeometry(100, 100, 1200, 800)
+        
+        # 应用设置
+        self.settings = QSettings("AdvancedKeyTools", "GUI_v3.5")
+        
+        # 当前密钥信息
+        self.current_key_info: Optional[KeyInfo] = None
+        self.current_image_path = ""
+        
+
+        
+        # 初始化UI
+        self.init_ui()
+        
+        # 应用样式
+        self.apply_styles()
+        
+
+        
+        # 状态栏
+        self.statusBar().showMessage("准备就绪")
+    
+    def init_ui(self):
+        """初始化用户界面"""
+        # 创建菜单栏
+        self.create_menu_bar()
+        
+        # 创建工具栏
+        self.create_toolbar()
+        
+        # 创建主窗口部件
+        self.main_widget = QWidget()
+        self.setCentralWidget(self.main_widget)
+        
+        # 主布局
+        self.main_layout = QVBoxLayout(self.main_widget)
+        
+        # 创建选项卡
+        self.tabs = QTabWidget()
+        self.main_layout.addWidget(self.tabs)
+        
+        # 创建各个功能标签页
+        self.setup_keygen_tab()
+        self.setup_rsa_crypto_tab()
+        self.setup_image_steganography_tab()
+        self.setup_file_crypto_tab()
+        self.setup_settings_tab()  # 添加设置标签页
+        
+        # 添加标签页
+        self.tabs.addTab(self.keygen_tab, "密钥生成")
+        self.tabs.addTab(self.rsa_crypto_tab, "RSA加解密")
+        self.tabs.addTab(self.image_stego_tab, "图种制作器")
+        self.tabs.addTab(self.file_crypto_tab, "文件加解密")
+        self.tabs.addTab(self.settings_tab, "设置")  # 添加设置标签页
+    
+    def create_menu_bar(self):
+        """创建菜单栏"""
+        menu_bar = self.menuBar()
+        
+        # 文件菜单
+        file_menu = menu_bar.addMenu("文件")
+        
+        save_action = QAction("保存密钥", self)
+        save_action.setShortcut("Ctrl+S")
+        save_action.triggered.connect(self.save_current_keys)
+        file_menu.addAction(save_action)
+        
+        load_action = QAction("加载密钥", self)
+        load_action.setShortcut("Ctrl+O")
+        load_action.triggered.connect(self.load_keys)
+        file_menu.addAction(load_action)
+        
+        file_menu.addSeparator()
+        
+        exit_action = QAction("退出", self)
+        exit_action.setShortcut("Ctrl+Q")
+        exit_action.triggered.connect(self.close)
+        file_menu.addAction(exit_action)
+        
+        # 工具菜单
+        tools_menu = menu_bar.addMenu("工具")
+        
+        key_info_action = QAction("查看密钥信息", self)
+        key_info_action.triggered.connect(self.show_key_info)
+        tools_menu.addAction(key_info_action)
+        
+        entropy_action = QAction("查看熵源信息", self)
+        entropy_action.triggered.connect(self.show_entropy_info)
+        tools_menu.addAction(entropy_action)
+        
+        # 帮助菜单
+        help_menu = menu_bar.addMenu("帮助")
+        
+        about_action = QAction("关于", self)
+        about_action.triggered.connect(self.show_about)
+        help_menu.addAction(about_action)
+    
+    def create_toolbar(self):
+        """创建工具栏"""
+        toolbar = self.addToolBar("主工具栏")
+        toolbar.setMovable(False)
+        toolbar.setFloatable(False)
+        
+        # 读取密钥包按钮
+        load_btn = QToolButton()
+        load_btn.setText("读取密钥包")
+        load_btn.setIcon(self.style().standardIcon(QStyle.SP_DialogOpenButton))
+        load_btn.clicked.connect(self.load_keys)
+        load_btn.setToolTip("从ZIP文件中加载密钥包")
+        toolbar.addWidget(load_btn)
+        
+        # 使用当前密钥按钮
+        use_key_btn = QToolButton()
+        use_key_btn.setText("使用当前密钥")
+        use_key_btn.setIcon(self.style().standardIcon(QStyle.SP_DialogApplyButton))
+        use_key_btn.clicked.connect(self.use_current_keys)
+        use_key_btn.setToolTip("将当前生成的密钥应用到其他功能模块")
+        toolbar.addWidget(use_key_btn)
+        
+        toolbar.addSeparator()
+        
+        # 保存密钥按钮
+        save_btn = QToolButton()
+        save_btn.setText("保存密钥")
+        save_btn.setIcon(self.style().standardIcon(QStyle.SP_DialogSaveButton))
+        save_btn.clicked.connect(self.save_current_keys)
+        save_btn.setToolTip("将当前密钥保存为ZIP文件")
+        toolbar.addWidget(save_btn)
+    
+    def apply_styles(self):
+        """应用样式"""
+        self.setStyleSheet("""
+            QMainWindow {
+                background-color: #f0f0f0;
+            }
+            QGroupBox {
+                font-weight: bold;
+                border: 1px solid #cccccc;
+                border-radius: 5px;
+                margin-top: 1ex;
+                padding-top: 10px;
+                background-color: #ffffff;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                subcontrol-position: top left;
+                padding: 0 3px;
+                background-color: #f0f0f0;
+            }
+            QTextEdit, QLineEdit {
+                font-family: "Consolas", "Courier New", monospace;
+                border: 1px solid #cccccc;
+                border-radius: 3px;
+                padding: 3px;
+            }
+            QPushButton {
+                border: 1px solid #cccccc;
+                border-radius: 3px;
+                padding: 5px 10px;
+                background-color: #e1e1e1;
+            }
+            QPushButton:hover {
+                background-color: #d0d0d0;
+            }
+            QPushButton:pressed {
+                background-color: #c0c0c0;
+            }
+            QProgressBar {
+                text-align: center;
+                border: 1px solid #cccccc;
+                border-radius: 3px;
+            }
+            QProgressBar::chunk {
+                background-color: #4CAF50;
+            }
+            QLabel {
+                font-size: 10pt;
+            }
+            QTabWidget::pane {
+                border: 1px solid #cccccc;
+                border-radius: 3px;
+            }
+            QTabBar::tab {
+                background: #e1e1e1;
+                border: 1px solid #cccccc;
+                border-bottom-color: #cccccc;
+                border-top-left-radius: 3px;
+                border-top-right-radius: 3px;
+                padding: 5px;
+            }
+            QTabBar::tab:selected {
+                background: #ffffff;
+                border-bottom-color: #ffffff;
+            }
+        """)
+    
+    def setup_keygen_tab(self):
+        """设置密钥生成标签页"""
+        self.keygen_tab = QWidget()
+        layout = QVBoxLayout(self.keygen_tab)
+        
+        # 密钥生成控制组
+        group = QGroupBox("密钥生成")
+        group_layout = QVBoxLayout(group)
+        
+        # 生成密钥按钮
+        self.btn_generate = QPushButton("生成高级密钥")
+        self.btn_generate.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold;")
+        self.btn_generate.clicked.connect(self.generate_keys)
+        group_layout.addWidget(self.btn_generate)
+        
+        # 进度条
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 100)
+        group_layout.addWidget(self.progress)
+        
+        # 状态标签
+        self.status_label = QLabel("准备生成密钥...")
+        group_layout.addWidget(self.status_label)
+        
+
+        
+        # 密钥显示区域
+        self.key_result = QTextEdit()
+        self.key_result.setReadOnly(True)
+        self.key_result.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+        self.key_result.setFont(QFont("Consolas", 10))
+        group_layout.addWidget(self.key_result)
+        
+        layout.addWidget(group)
+    
+    def setup_rsa_crypto_tab(self):
+        """设置RSA加解密标签页"""
+        self.rsa_crypto_tab = QWidget()
+        layout = QVBoxLayout(self.rsa_crypto_tab)
+        
+        # 公钥区域
+        group_pub = QGroupBox("公钥")
+        group_pub_layout = QVBoxLayout(group_pub)
+        self.pub_key_text = QTextEdit()
+        self.pub_key_text.setPlaceholderText("在此粘贴或导入公钥")
+        self.pub_key_text.setFixedHeight(120)
+        self.pub_key_text.setFont(QFont("Consolas", 9))
+        group_pub_layout.addWidget(self.pub_key_text)
+        
+        # 使用当前公钥按钮
+        self.btn_use_current_pub = QPushButton("使用当前生成密钥的公钥")
+        self.btn_use_current_pub.clicked.connect(self.use_current_pub_key)
+        group_pub_layout.addWidget(self.btn_use_current_pub)
+        
+        # 私钥区域
+        group_priv = QGroupBox("私钥")
+        group_priv_layout = QVBoxLayout(group_priv)
+        self.priv_key_text = QTextEdit()
+        self.priv_key_text.setPlaceholderText("在此粘贴或导入私钥")
+        self.priv_key_text.setFixedHeight(120)
+        self.priv_key_text.setFont(QFont("Consolas", 9))
+        group_priv_layout.addWidget(self.priv_key_text)
+        
+        # 使用当前私钥按钮
+        self.btn_use_current_priv = QPushButton("使用当前生成密钥的私钥")
+        self.btn_use_current_priv.clicked.connect(self.use_current_priv_key)
+        group_priv_layout.addWidget(self.btn_use_current_priv)
+        
+        layout.addWidget(group_pub)
+        layout.addWidget(group_priv)
+        
+        # 输入区域
+        group_input = QGroupBox("加解密操作")
+        group_input_layout = QVBoxLayout(group_input)
+        
+        # 明文区域
+        self.input_text = QTextEdit()
+        self.input_text.setPlaceholderText("输入要加密的文本或解密的Base64密文")
+        self.input_text.setFont(QFont("Consolas", 10))
+        group_input_layout.addWidget(self.input_text)
+        
+        # 加密按钮
+        self.btn_encrypt = QPushButton("加密")
+        self.btn_encrypt.setStyleSheet("background-color: #2196F3; color: white;")
+        self.btn_encrypt.clicked.connect(self.encrypt_text)
+        group_input_layout.addWidget(self.btn_encrypt)
+        
+        # 解密按钮
+        self.btn_decrypt = QPushButton("解密")
+        self.btn_decrypt.setStyleSheet("background-color: #FF9800; color: white;")
+        self.btn_decrypt.clicked.connect(self.decrypt_text)
+        group_input_layout.addWidget(self.btn_decrypt)
+        
+        layout.addWidget(group_input)
+        
+        # 结果区域
+        group_result = QGroupBox("结果")
+        group_result_layout = QVBoxLayout(group_result)
+        self.result_text = QTextEdit()
+        self.result_text.setReadOnly(True)
+        self.result_text.setFont(QFont("Consolas", 10))
+        group_result_layout.addWidget(self.result_text)
+        
+        layout.addWidget(group_result)
+    
+    def setup_image_steganography_tab(self):
+        """设置图种制作标签页"""
+        self.image_stego_tab = QWidget()
+        layout = QVBoxLayout(self.image_stego_tab)
+        
+        # 图片选择
+        group_image = QGroupBox("选择图片")
+        group_image_layout = QVBoxLayout(group_image)
+        
+        self.image_path = QLineEdit()
+        self.image_path.setReadOnly(True)
+        group_image_layout.addWidget(self.image_path)
+        
+        h_layout = QHBoxLayout()
+        self.btn_browse_image = QPushButton("浏览图片")
+        self.btn_browse_image.clicked.connect(self.browse_image)
+        h_layout.addWidget(self.btn_browse_image)
+        
+        self.btn_preview_image = QPushButton("预览图片")
+        self.btn_preview_image.clicked.connect(self.preview_image)
+        h_layout.addWidget(self.btn_preview_image)
+        
+        group_image_layout.addLayout(h_layout)
+        
+        # 图片预览
+        self.image_preview = QLabel()
+        self.image_preview.setAlignment(Qt.AlignCenter)
+        self.image_preview.setMinimumHeight(200)
+        self.image_preview.setStyleSheet("background-color: #f0f0f0; border: 1px solid #cccccc;")
+        self.image_preview.setText("图片预览")
+        group_image_layout.addWidget(self.image_preview)
+        
+        layout.addWidget(group_image)
+        
+        # 文件嵌入
+        group_embed = QGroupBox("嵌入文件")
+        group_embed_layout = QVBoxLayout(group_embed)
+        
+        self.file_path = QLineEdit()
+        self.file_path.setReadOnly(True)
+        group_embed_layout.addWidget(self.file_path)
+        
+        h_layout = QHBoxLayout()
+        self.btn_browse_file = QPushButton("浏览文件")
+        self.btn_browse_file.clicked.connect(self.browse_file)
+        h_layout.addWidget(self.btn_browse_file)
+        
+        self.btn_create_stego = QPushButton("创建图种")
+        self.btn_create_stego.setStyleSheet("background-color: #9C27B0; color: white; font-weight: bold;")
+        self.btn_create_stego.clicked.connect(self.create_stego_image)
+        h_layout.addWidget(self.btn_create_stego)
+        
+        group_embed_layout.addLayout(h_layout)
+        
+        # 保存位置选项
+        h_layout = QHBoxLayout()
+        self.save_location = QLineEdit()
+        self.save_location.setPlaceholderText("选择保存位置...")
+        self.save_location.setReadOnly(True)
+        h_layout.addWidget(self.save_location)
+        
+        self.btn_browse_save = QPushButton("浏览位置")
+        self.btn_browse_save.clicked.connect(self.browse_save_location)
+        h_layout.addWidget(self.btn_browse_save)
+        
+        group_embed_layout.addLayout(h_layout)
+        
+        # 提取图种
+        group_extract = QGroupBox("提取隐藏文件")
+        group_extract_layout = QVBoxLayout(group_extract)
+        
+        h_layout = QHBoxLayout()
+        self.btn_extract_stego = QPushButton("提取文件")
+        self.btn_extract_stego.setStyleSheet("background-color: #E91E63; color: white;")
+        self.btn_extract_stego.clicked.connect(self.extract_from_stego)
+        h_layout.addWidget(self.btn_extract_stego)
+        
+        self.btn_test_stego = QPushButton("测试图种")
+        self.btn_test_stego.setStyleSheet("background-color: #607D8B; color: white;")
+        self.btn_test_stego.clicked.connect(self.test_stego_image)
+        h_layout.addWidget(self.btn_test_stego)
+        
+        group_extract_layout.addLayout(h_layout)
+        
+        # 状态信息
+        self.stego_status = QLabel("请先选择图片和要隐藏的文件")
+        group_extract_layout.addWidget(self.stego_status)
+        
+        layout.addWidget(group_embed)
+        layout.addWidget(group_extract)
+    
+    def setup_file_crypto_tab(self):
+        """设置文件加解密标签页"""
+        self.file_crypto_tab = QWidget()
+        layout = QVBoxLayout(self.file_crypto_tab)
+        
+        # 对称密钥区域
+        group_sym_key = QGroupBox("对称密钥")
+        group_sym_key_layout = QVBoxLayout(group_sym_key)
+        
+        self.sym_key_text = QTextEdit()
+        self.sym_key_text.setPlaceholderText("在此输入或粘贴对称密钥")
+        self.sym_key_text.setFixedHeight(100)
+        self.sym_key_text.setFont(QFont("Consolas", 9))
+        group_sym_key_layout.addWidget(self.sym_key_text)
+        
+        # 使用当前密钥按钮
+        self.btn_use_current_key = QPushButton("使用当前生成的格式化密钥")
+        self.btn_use_current_key.clicked.connect(self.use_current_formatted_key)
+        group_sym_key_layout.addWidget(self.btn_use_current_key)
+        
+        layout.addWidget(group_sym_key)
+        
+        # 公钥区域
+        group_pub = QGroupBox("公钥 (用于加密对称密钥)")
+        group_pub_layout = QVBoxLayout(group_pub)
+        self.file_pub_key_text = QTextEdit()
+        self.file_pub_key_text.setPlaceholderText("在此粘贴或导入公钥")
+        self.file_pub_key_text.setFixedHeight(100)
+        self.file_pub_key_text.setFont(QFont("Consolas", 9))
+        group_pub_layout.addWidget(self.file_pub_key_text)
+        
+        # 使用当前公钥按钮
+        self.btn_use_current_pub_file = QPushButton("使用当前生成密钥的公钥")
+        self.btn_use_current_pub_file.clicked.connect(self.use_current_pub_key_file)
+        group_pub_layout.addWidget(self.btn_use_current_pub_file)
+        
+        layout.addWidget(group_pub)
+        
+        # 私钥区域
+        group_priv = QGroupBox("私钥 (用于解密对称密钥)")
+        group_priv_layout = QVBoxLayout(group_priv)
+        self.file_priv_key_text = QTextEdit()
+        self.file_priv_key_text.setPlaceholderText("在此粘贴或导入私钥")
+        self.file_priv_key_text.setFixedHeight(100)
+        self.file_priv_key_text.setFont(QFont("Consolas", 9))
+        group_priv_layout.addWidget(self.file_priv_key_text)
+        
+        # 使用当前私钥按钮
+        self.btn_use_current_priv_file = QPushButton("使用当前生成密钥的私钥")
+        self.btn_use_current_priv_file.clicked.connect(self.use_current_priv_key_file)
+        group_priv_layout.addWidget(self.btn_use_current_priv_file)
+        
+        layout.addWidget(group_priv)
+        
+        # 文件操作区域
+        group_file_ops = QGroupBox("文件操作")
+        group_file_ops_layout = QGridLayout(group_file_ops)
+        
+        # 加密文件部分
+        self.encrypt_file_path = QLineEdit()
+        self.encrypt_file_path.setReadOnly(True)
+        group_file_ops_layout.addWidget(QLabel("选择要加密的文件:"), 0, 0)
+        group_file_ops_layout.addWidget(self.encrypt_file_path, 0, 1)
+        
+        self.btn_browse_encrypt = QPushButton("浏览")
+        self.btn_browse_encrypt.clicked.connect(self.browse_encrypt_file)
+        group_file_ops_layout.addWidget(self.btn_browse_encrypt, 0, 2)
+        
+        self.btn_encrypt_file = QPushButton("加密文件")
+        self.btn_encrypt_file.setStyleSheet("background-color: #2196F3; color: white;")
+        self.btn_encrypt_file.clicked.connect(self.encrypt_file)
+        group_file_ops_layout.addWidget(self.btn_encrypt_file, 0, 3)
+        
+        # 解密文件部分
+        self.decrypt_file_path = QLineEdit()
+        self.decrypt_file_path.setReadOnly(True)
+        group_file_ops_layout.addWidget(QLabel("选择要解密的文件 (.aktp):"), 1, 0)
+        group_file_ops_layout.addWidget(self.decrypt_file_path, 1, 1)
+        
+        self.btn_browse_decrypt = QPushButton("浏览")
+        self.btn_browse_decrypt.clicked.connect(self.browse_decrypt_file)
+        group_file_ops_layout.addWidget(self.btn_browse_decrypt, 1, 2)
+        
+        self.btn_decrypt_file = QPushButton("解密文件")
+        self.btn_decrypt_file.setStyleSheet("background-color: #FF9800; color: white;")
+        self.btn_decrypt_file.clicked.connect(self.decrypt_file)
+        group_file_ops_layout.addWidget(self.btn_decrypt_file, 1, 3)
+        
+        # 保存位置
+        self.file_save_location = QLineEdit()
+        self.file_save_location.setPlaceholderText("选择保存位置...")
+        self.file_save_location.setReadOnly(True)
+        group_file_ops_layout.addWidget(QLabel("保存位置:"), 2, 0)
+        group_file_ops_layout.addWidget(self.file_save_location, 2, 1)
+        
+        self.btn_browse_file_save = QPushButton("浏览位置")
+        self.btn_browse_file_save.clicked.connect(self.browse_file_save_location)
+        group_file_ops_layout.addWidget(self.btn_browse_file_save, 2, 2)
+        
+        # 状态信息
+        self.file_crypto_status = QLabel("准备进行文件加解密操作")
+        group_file_ops_layout.addWidget(self.file_crypto_status, 3, 0, 1, 4)
+        
+        layout.addWidget(group_file_ops)
+    
+    def setup_settings_tab(self):
+        """设置选项卡"""
+        self.settings_tab = QWidget()
+        layout = QVBoxLayout(self.settings_tab)
+        
+        # 其他设置
+        other_group = QGroupBox("其他设置")
+        other_layout = QVBoxLayout(other_group)
+        
+        # 自动保存
+        self.auto_save_checkbox = QCheckBox("自动生成密钥后自动保存")
+        self.auto_save_checkbox.setChecked(self.settings.value("auto_save", True, type=bool))
+        other_layout.addWidget(self.auto_save_checkbox)
+        
+        # 默认保存路径
+        path_layout = QHBoxLayout()
+        path_layout.addWidget(QLabel("默认保存路径:"))
+        self.default_save_path = QLineEdit()
+        self.default_save_path.setText(self.settings.value("default_save_path", ""))
+        path_layout.addWidget(self.default_save_path)
+        browse_path_btn = QPushButton("浏览")
+        browse_path_btn.clicked.connect(self.browse_default_save_path)
+        path_layout.addWidget(browse_path_btn)
+        other_layout.addLayout(path_layout)
+        
+        layout.addWidget(other_group)
+        
+        # 保存设置按钮
+        save_settings_btn = QPushButton("保存所有设置")
+        save_settings_btn.clicked.connect(self.save_all_settings)
+        layout.addWidget(save_settings_btn)
+        
+        layout.addStretch()
+    
+
+    
+    def browse_default_save_path(self):
+        """浏览默认保存路径"""
+        options = QFileDialog.Options()
+        save_dir = QFileDialog.getExistingDirectory(self, "选择默认保存路径", 
+                                                   self.default_save_path.text() or os.path.expanduser("~"), 
+                                                   options=options)
+        if save_dir:
+            self.default_save_path.setText(save_dir)
+    
+    def save_all_settings(self):
+        """保存所有设置"""
+        self.settings.setValue("auto_save", self.auto_save_checkbox.isChecked())
+        self.settings.setValue("default_save_path", self.default_save_path.text())
+        QMessageBox.information(self, "设置保存", "所有设置已保存!")
+    
+    def generate_keys(self):
+        """启动密钥生成"""
+        self.btn_generate.setEnabled(False)
+        self.status_label.setText("密钥生成中，请稍候...")
+        self.progress.setValue(0)
+        
+        self.worker = EnhancedKeyGeneratorThread()
+        self.worker.progress.connect(self.update_progress)
+        self.worker.completed.connect(self.key_generated)
+        self.worker.error.connect(self.key_error)
+        self.worker.start()
+    
+    def update_progress(self, value: int, message: str):
+        """更新进度"""
+        self.progress.setValue(value)
+        self.status_label.setText(message)
+        self.statusBar().showMessage(message)
+    
+    def key_generated(self, key_info: KeyInfo):
+        """密钥生成完成处理"""
+        self.current_key_info = key_info
+        
+        result = f"""===== 高级密钥生成结果 =====
+
+密钥ID: {key_info.key_id}
+生成时间: {key_info.creation_time}
+
+===== 格式化密钥 =====
+{key_info.formatted_key}
+
+===== 完整十六进制 =====
+{key_info.hex_key}
+
+===== 公钥 =====
+{key_info.public_key}
+
+===== 私钥 =====
+{key_info.private_key}
+"""
+        
+        self.key_result.setText(result)
+        self.status_label.setText("密钥生成成功!")
+        self.btn_generate.setEnabled(True)
+        self.statusBar().showMessage("密钥生成成功!")
+        
+        # 自动保存文件
+        if self.auto_save_checkbox.isChecked():
+            self.save_key_files(key_info)
+    
+    def key_error(self, error_msg: str):
+        """密钥生成错误处理"""
+        QMessageBox.critical(self, "密钥生成错误", f"生成密钥时出错:\n{error_msg}")
+        self.status_label.setText(f"错误: {error_msg}")
+        self.btn_generate.setEnabled(True)
+        self.statusBar().showMessage("密钥生成失败!")
+    
+    def save_key_files(self, key_info: KeyInfo):
+        """保存密钥文件为ZIP包"""
+        try:
+            temp_dir = tempfile.mkdtemp(prefix="keygen_")
+            
+            # 保存格式化密钥
+            txt_path = os.path.join(temp_dir, "key.txt")
+            with open(txt_path, "w", encoding="utf-8") as f:
+                f.write(f"密钥ID: {key_info.key_id}\n")
+                f.write(f"生成时间: {key_info.creation_time}\n\n")
+                f.write("===== 格式化密钥 =====\n")
+                f.write(key_info.formatted_key)
+                f.write("\n\n===== 完整十六进制 =====\n")
+                f.write(key_info.hex_key)
+            
+            # 保存公钥
+            pem_path = os.path.join(temp_dir, "key.pem")
+            with open(pem_path, "w", encoding="utf-8") as f:
+                f.write(key_info.public_key)
+            
+            # 保存私钥
+            key_path = os.path.join(temp_dir, "key.key")
+            with open(key_path, "w", encoding="utf-8") as f:
+                f.write(key_info.private_key)
+            
+            # 选择保存位置
+            options = QFileDialog.Options()
+            save_path, _ = QFileDialog.getSaveFileName(
+                self, "保存密钥文件", 
+                os.path.join(self.default_save_path.text() or os.path.expanduser("~"), 
+                             f"密钥包_{time.strftime('%Y%m%d_%H%M%S')}.zip"),
+                "ZIP文件 (*.zip)", 
+                options=options
+            )
+            
+            if not save_path:
+                return  # 用户取消
+                
+            # 创建ZIP文件
+            with zipfile.ZipFile(save_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                for file in [txt_path, pem_path, key_path]:
+                    zipf.write(file, os.path.basename(file))
+            
+            # 清理临时文件
+            shutil.rmtree(temp_dir)
+            
+            # 显示成功消息
+            self.statusBar().showMessage(f"密钥文件已保存到: {save_path}")
+            QMessageBox.information(self, "文件保存成功", 
+                                  f"密钥文件已保存到:\n{save_path}\n"
+                                  f"解压密码: {key_info.key_id}")
+        except Exception as e:
+            logging.error(f"保存密钥文件失败: {e}")
+            QMessageBox.warning(self, "保存失败", f"保存密钥文件时出错:\n{str(e)}")
+    
+    def save_current_keys(self):
+        """保存当前密钥"""
+        if not self.current_key_info:
+            QMessageBox.warning(self, "无密钥", "请先生成密钥!")
+            return
+        
+        # 自动保存密钥文件
+        self.save_key_files(self.current_key_info)
+    
+    def load_keys(self):
+        """加载密钥"""
+        options = QFileDialog.Options()
+        file, _ = QFileDialog.getOpenFileName(self, "选择密钥文件", 
+                                             self.default_save_path.text() or os.path.expanduser("~"),
+                                             "ZIP文件 (*.zip);;所有文件 (*.*)", 
+                                             options=options)
+        if file:
+            try:
+                # 解压文件（无密码）
+                temp_dir = tempfile.mkdtemp(prefix="keyload_")
+                with zipfile.ZipFile(file, 'r') as zipf:
+                    zipf.extractall(temp_dir)
+                
+                # 读取密钥信息
+                key_info = KeyInfo(
+                    key_id="",
+                    formatted_key="",
+                    hex_key="",
+                    public_key="",
+                    private_key="",
+                    creation_time="",
+                    entropy_sources={}
+                )
+                
+                # 读取TXT文件
+                txt_path = os.path.join(temp_dir, "key.txt")
+                if os.path.exists(txt_path):
+                    with open(txt_path, "r", encoding="utf-8") as f:
+                        content = f.read()
+                        # 解析密钥ID和生成时间
+                        lines = content.split("\n")
+                        for line in lines:
+                            if line.startswith("密钥ID: "):
+                                key_info.key_id = line[6:].strip()
+                            elif line.startswith("生成时间: "):
+                                key_info.creation_time = line[6:].strip()
+                        
+                        # 读取整个文件内容后再进行关键字检测
+                        content = "\n".join(lines)
+                        
+                        # 提取格式化密钥
+                        if "===== 格式化密钥 =====" in content and "===== 完整十六进制 =====" in content:
+                            formatted_key_part = content.split("===== 格式化密钥 =====")[1].split("===== 完整十六进制 =====")[0]
+                            key_info.formatted_key = formatted_key_part.strip()
+                        elif "===== 格式化密钥 =====" in content:
+                            formatted_key_part = content.split("===== 格式化密钥 =====")[1]
+                            if "=====" in formatted_key_part:
+                                formatted_key_part = formatted_key_part.split("=====")[0]
+                            key_info.formatted_key = formatted_key_part.strip()
+                        
+                        # 提取完整十六进制密钥
+                        if "===== 完整十六进制 =====" in content:
+                            hex_key_part = content.split("===== 完整十六进制 =====")[1]
+                            if "=====" in hex_key_part:
+                                hex_key_part = hex_key_part.split("=====")[0]
+                            key_info.hex_key = hex_key_part.strip()
+                
+                # 读取PEM文件
+                pem_path = os.path.join(temp_dir, "key.pem")
+                if os.path.exists(pem_path):
+                    with open(pem_path, "r", encoding="utf-8") as f:
+                        public_key_content = f.read()
+                        # 为公钥添加头尾标识
+                        if not public_key_content.startswith("-----BEGIN PUBLIC KEY-----"):
+                            key_info.public_key = f"-----BEGIN PUBLIC KEY-----\n{public_key_content}\n-----END PUBLIC KEY-----"
+                        else:
+                            key_info.public_key = public_key_content
+                
+                # 读取KEY文件
+                key_path = os.path.join(temp_dir, "key.key")
+                if os.path.exists(key_path):
+                    with open(key_path, "r", encoding="utf-8") as f:
+                        private_key_content = f.read()
+                        # 为私钥添加头尾标识
+                        if not private_key_content.startswith("-----BEGIN RSA PRIVATE KEY-----"):
+                            key_info.private_key = f"-----BEGIN RSA PRIVATE KEY-----\n{private_key_content}\n-----END RSA PRIVATE KEY-----"
+                        else:
+                            key_info.private_key = private_key_content
+                
+                # 清理临时文件
+                shutil.rmtree(temp_dir)
+                
+                # 更新当前密钥
+                self.current_key_info = key_info
+                
+                # 更新显示
+                result = f"""===== 加载的密钥信息 =====
+
+密钥ID: {key_info.key_id}
+生成时间: {key_info.creation_time}
+
+===== 格式化密钥 =====
+{key_info.formatted_key}
+
+===== 完整十六进制 =====
+{key_info.hex_key}
+
+===== 公钥 =====
+{key_info.public_key}
+
+===== 私钥 =====
+{key_info.private_key}
+"""
+                self.key_result.setText(result)
+                
+                self.statusBar().showMessage("密钥加载成功!")
+                QMessageBox.information(self, "加载成功", "密钥已成功加载!")
+            except Exception as e:
+                logging.error(f"加载密钥失败: {e}")
+                QMessageBox.critical(self, "加载失败", f"加载密钥时出错:\n{str(e)}")
+    
+    def use_current_keys(self):
+        """使用当前密钥"""
+        if not self.current_key_info:
+            QMessageBox.warning(self, "无密钥", "请先生成密钥!")
+            return
+        
+        # 在RSA加解密标签页中使用密钥
+        self.pub_key_text.setPlainText(self.current_key_info.public_key)
+        self.priv_key_text.setPlainText(self.current_key_info.private_key)
+        
+        # 在文件加解密标签页中使用密钥
+        self.sym_key_text.setPlainText(self.current_key_info.formatted_key)
+        self.file_pub_key_text.setPlainText(self.current_key_info.public_key)
+        self.file_priv_key_text.setPlainText(self.current_key_info.private_key)
+        
+        self.statusBar().showMessage("当前密钥已应用到所有相关区域!")
+        QMessageBox.information(self, "密钥应用", "当前密钥已成功应用到所有相关区域!")
+    
+    def show_key_info(self):
+        """显示密钥信息"""
+        if not self.current_key_info:
+            QMessageBox.warning(self, "无密钥", "请先生成密钥!")
+            return
+        
+        info = f"""密钥ID: {self.current_key_info.key_id}
+生成时间: {self.current_key_info.creation_time}
+密钥长度: {len(self.current_key_info.hex_key) * 4} 位
+"""
+        QMessageBox.information(self, "密钥信息", info)
+    
+    def show_entropy_info(self):
+        """显示熵源信息"""
+        if not self.current_key_info or not self.current_key_info.entropy_sources:
+            QMessageBox.warning(self, "无熵源信息", "请先生成密钥!")
+            return
+        
+        info = "熵源信息:\n\n"
+        for key, value in self.current_key_info.entropy_sources.items():
+            info += f"{key}: {value}\n"
+        
+        # 显示在新窗口中
+        dialog = QDialog(self)
+        dialog.setWindowTitle("熵源信息")
+        dialog.resize(600, 400)
+        
+        layout = QVBoxLayout(dialog)
+        text_edit = QTextEdit()
+        text_edit.setReadOnly(True)
+        text_edit.setText(info)
+        layout.addWidget(text_edit)
+        
+        dialog.exec_()
+    
+    def show_about(self):
+        """显示关于信息"""
+        QMessageBox.about(self, "关于", "高级密钥工具 v3.5\n\n一个集成多种密码学技术的安全工具套件")
+    
+    # RSA加解密功能
+    def use_current_pub_key(self):
+        """使用当前生成的公钥"""
+        if self.current_key_info and self.current_key_info.public_key:
+            self.pub_key_text.setPlainText(self.current_key_info.public_key)
+            self.statusBar().showMessage("当前公钥已加载!")
+        else:
+            QMessageBox.warning(self, "无公钥", "请先生成密钥对!")
+    
+    def use_current_priv_key(self):
+        """使用当前生成的私钥"""
+        if self.current_key_info and self.current_key_info.private_key:
+            self.priv_key_text.setPlainText(self.current_key_info.private_key)
+            self.statusBar().showMessage("当前私钥已加载!")
+        else:
+            QMessageBox.warning(self, "无私钥", "请先生成密钥对!")
+    
+    def encrypt_text(self):
+        """加密文本"""
+        public_key = self.pub_key_text.toPlainText().strip()
+        text = self.input_text.toPlainText().strip()
+        
+        if not public_key:
+            QMessageBox.warning(self, "缺少公钥", "请输入或选择公钥!")
+            return
+            
+        if not text:
+            QMessageBox.warning(self, "缺少明文", "请输入要加密的文本!")
+            return
+        
+        try:
+            # 导入公钥
+            rsa_key = RSA.import_key(public_key)
+            cipher = PKCS1_OAEP.new(rsa_key)
+            
+            # 加密文本
+            encrypted = cipher.encrypt(text.encode())
+            
+            # Base64编码
+            encrypted_b64 = base64.b64encode(encrypted).decode()
+            
+            # 显示结果
+            self.result_text.setPlainText(encrypted_b64)
+            self.statusBar().showMessage("加密成功!")
+        except Exception as e:
+            QMessageBox.critical(self, "加密错误", f"加密过程中出错:\n{str(e)}")
+    
+    def decrypt_text(self):
+        """解密文本"""
+        private_key = self.priv_key_text.toPlainText().strip()
+        encrypted_b64 = self.input_text.toPlainText().strip()
+        
+        if not private_key:
+            QMessageBox.warning(self, "缺少私钥", "请输入或选择私钥!")
+            return
+            
+        if not encrypted_b64:
+            QMessageBox.warning(self, "缺少密文", "请输入要解密的Base64密文!")
+            return
+        
+        try:
+            # Base64解码
+            encrypted = base64.b64decode(encrypted_b64)
+            
+            # 导入私钥
+            rsa_key = RSA.import_key(private_key)
+            cipher = PKCS1_OAEP.new(rsa_key)
+            
+            # 解密
+            decrypted = cipher.decrypt(encrypted).decode()
+            
+            # 显示结果
+            self.result_text.setPlainText(decrypted)
+            self.statusBar().showMessage("解密成功!")
+        except Exception as e:
+            QMessageBox.critical(self, "解密错误", f"解密过程中出错:\n{str(e)}")
+    
+    # 图种制作器功能
+    def browse_image(self):
+        """浏览图片"""
+        options = QFileDialog.Options()
+        file, _ = QFileDialog.getOpenFileName(self, "选择图片", "", 
+                                             "图片文件 (*.png *.jpg *.jpeg *.bmp);;所有文件 (*.*)", 
+                                             options=options)
+        if file:
+            self.image_path.setText(file)
+            self.current_image_path = file
+            self.stego_status.setText("图片已选择")
+    
+    def browse_file(self):
+        """浏览文件"""
+        options = QFileDialog.Options()
+        file, _ = QFileDialog.getOpenFileName(self, "选择要隐藏的文件", "", 
+                                             "所有文件 (*.*)", 
+                                             options=options)
+        if file:
+            self.file_path.setText(file)
+            self.stego_status.setText("文件已选择")
+    
+    def browse_save_location(self):
+        """浏览保存位置"""
+        options = QFileDialog.Options()
+        save_dir = QFileDialog.getExistingDirectory(self, "选择保存位置", 
+                                                   self.default_save_path.text() or os.path.expanduser("~"), 
+                                                   options=options)
+        if save_dir:
+            self.save_location.setText(save_dir)
+    
+    def preview_image(self):
+        """预览图片 - 使用系统API"""
+        if not self.current_image_path:
+            QMessageBox.warning(self, "无图片", "请先选择一张图片!")
+            return
+        
+        try:
+            # 使用QPixmap直接加载图片
+            pixmap = QPixmap(self.current_image_path)
+            
+            if pixmap.isNull():
+                QMessageBox.warning(self, "预览错误", "无法加载图片!")
+                return
+            
+            # 调整大小用于预览
+            max_width = 600
+            max_height = 400
+            if pixmap.width() > max_width or pixmap.height() > max_height:
+                pixmap = pixmap.scaled(max_width, max_height, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            
+            # 设置预览
+            self.image_preview.setPixmap(pixmap)
+            self.image_preview.setScaledContents(True)
+            
+        except Exception as e:
+            QMessageBox.critical(self, "预览错误", f"图片预览失败:\n{str(e)}")
+    
+    def create_stego_image(self):
+        """创建图种"""
+        image_path = self.image_path.text().strip()
+        file_path = self.file_path.text().strip()
+        save_dir = self.save_location.text().strip()
+        
+        if not image_path:
+            QMessageBox.warning(self, "无图片", "请先选择一张图片!")
+            return
+            
+        if not file_path:
+            QMessageBox.warning(self, "无文件", "请先选择要隐藏的文件!")
+            return
+            
+        # 设置默认保存位置
+        if not save_dir:
+            save_dir = self.default_save_path.text() or os.path.dirname(image_path)
+        
+        try:
+            # 读取图片
+            with open(image_path, "rb") as img_file:
+                image_data = img_file.read()
+            
+            # 检查文件是否已经是ZIP格式
+            is_zip_file = False
+            try:
+                with zipfile.ZipFile(file_path, 'r') as zip_test:
+                    is_zip_file = True
+            except zipfile.BadZipFile:
+                is_zip_file = False
+            
+            # 如果不是ZIP文件，则打包为.zip文件
+            if not is_zip_file:
+                # 创建临时.zip文件
+                temp_zip_path = os.path.join(save_dir, f"{os.path.basename(file_path)}.zip")
+                with zipfile.ZipFile(temp_zip_path, 'w', zipfile.ZIP_STORED) as zipf:
+                    zipf.write(file_path, os.path.basename(file_path))
+                
+                # 读取打包后的.zip文件
+                with open(temp_zip_path, "rb") as zip_file:
+                    file_data = zip_file.read()
+                
+                # 删除临时.zip文件
+                os.remove(temp_zip_path)
+                
+                # 使用.zip作为隐藏文件的扩展名
+                original_filename = f"{os.path.basename(file_path)}.zip".encode('utf-8')
+            else:
+                # 直接读取文件
+                with open(file_path, "rb") as file_file:
+                    file_data = file_file.read()
+                
+                # 获取原始文件名信息
+                original_filename = os.path.basename(file_path).encode('utf-8')
+            
+            filename_length = len(original_filename)
+            
+            # 创建图种（在文件数据前添加文件名信息）
+            stego_data = image_data + filename_length.to_bytes(4, byteorder='big') + original_filename + file_data
+            
+            # 保存图种
+            base_name = os.path.basename(image_path)
+            name, ext = os.path.splitext(base_name)
+            save_path = os.path.join(save_dir, f"{name}_stego{ext}")
+            
+            with open(save_path, "wb") as stego_file:
+                stego_file.write(stego_data)
+            
+            self.stego_status.setText(f"图种创建成功: {os.path.basename(save_path)}")
+            self.statusBar().showMessage(f"图种已保存到: {save_path}")
+            QMessageBox.information(self, "创建成功", 
+                                  f"图种创建成功!\n保存位置: {save_path}\n\n"
+                                  "使用说明:\n"
+                                  "1. 修改扩展名为.png查看图片\n"
+                                  "2. 修改扩展名为.zip解压文件")
+        except Exception as e:
+            logging.error(f"创建图种失败: {str(e)}")
+            QMessageBox.critical(self, "创建失败", f"创建图种时出错:\n{str(e)}")
+    
+    def extract_from_stego(self):
+        """从图种中提取文件"""
+        if not self.current_image_path:
+            QMessageBox.warning(self, "无图片", "请先选择一张包含隐藏文件的图片!")
+            return
+        
+        try:
+            # 读取文件
+            with open(self.current_image_path, "rb") as stego_file:
+                stego_data = stego_file.read()
+            
+            # 检测图片类型
+            try:
+                image = Image.open(io.BytesIO(stego_data))
+                image_type = image.format.lower()
+                image.close()
+            except Exception:
+                QMessageBox.critical(self, "无效图片", "无法识别图片格式!")
+                return
+            
+            # 查找图片结束位置
+            image_end = len(stego_data)  # 默认为整个文件长度
+            
+            if image_type == "png":
+                # PNG文件以IEND块结束
+                iend_pos = stego_data.rfind(b'IEND\xaeB`\x82')
+                if iend_pos != -1:
+                    image_end = iend_pos + 8  # IEND块总长12字节
+            elif image_type == "jpeg":
+                # JPEG文件以FF D9结束
+                jpeg_end = stego_data.rfind(b'\xFF\xD9')
+                if jpeg_end != -1:
+                    image_end = jpeg_end + 2
+            else:
+                # 对于其他格式，尝试查找常见结束标记
+                if b'\xFF\xD9' in stego_data:  # JPEG
+                    image_end = stego_data.rfind(b'\xFF\xD9') + 2
+                elif b'IEND\xaeB`\x82' in stego_data:  # PNG
+                    image_end = stego_data.rfind(b'IEND\xaeB`\x82') + 8
+            
+            # 提取隐藏文件信息
+            file_info_data = stego_data[image_end:]
+            
+            if not file_info_data:
+                QMessageBox.critical(self, "提取失败", "没有找到隐藏文件!")
+                return
+            
+            # 解析文件名信息
+            if len(file_info_data) < 4:
+                QMessageBox.critical(self, "提取失败", "隐藏文件信息不完整!")
+                return
+            
+            # 读取文件名长度
+            filename_length = int.from_bytes(file_info_data[:4], byteorder='big')
+            
+            # 检查数据是否足够
+            if len(file_info_data) < 4 + filename_length:
+                QMessageBox.critical(self, "提取失败", "隐藏文件信息不完整!")
+                return
+            
+            # 读取原始文件名
+            original_filename = file_info_data[4:4+filename_length].decode('utf-8')
+            
+            # 提取实际文件数据
+            file_data = file_info_data[4+filename_length:]
+            
+            # 检查隐藏的数据是否为ZIP格式
+            is_hidden_data_zip = False
+            try:
+                with zipfile.ZipFile(io.BytesIO(file_data), 'r') as zip_test:
+                    is_hidden_data_zip = True
+            except zipfile.BadZipFile:
+                is_hidden_data_zip = False
+            
+            if is_hidden_data_zip:
+                # 如果隐藏的数据是ZIP格式
+                if original_filename.lower().endswith('.zip'):
+                    # 如果原始文件名也是.zip，则直接保存ZIP文件
+                    save_dir = self.save_location.text().strip()
+                    if not save_dir:
+                        save_dir = self.default_save_path.text() or os.path.dirname(self.current_image_path)
+                    
+                    save_path, _ = QFileDialog.getSaveFileName(
+                        self, "保存隐藏文件", 
+                        os.path.join(save_dir, original_filename),
+                        "ZIP文件 (*.zip);;所有文件 (*.*)"
+                    )
+                    
+                    if save_path:
+                        with open(save_path, "wb") as extracted_file:
+                            extracted_file.write(file_data)
+                        
+                        self.statusBar().showMessage(f"ZIP文件已提取到: {save_path}")
+                        QMessageBox.information(self, "提取成功", f"ZIP文件已提取到:\n{save_path}")
+                else:
+                    # 如果原始文件名不是.zip，则解压其中的内容
+                    try:
+                        # 创建临时ZIP文件
+                        temp_zip_path = None
+                        with tempfile.NamedTemporaryFile(suffix='.zip', delete=False) as temp_zip:
+                            temp_zip.write(file_data)
+                            temp_zip_path = temp_zip.name
+                        
+                        # 尝试解压ZIP文件
+                        with zipfile.ZipFile(temp_zip_path, 'r') as zip_ref:
+                            # 获取ZIP文件中的文件列表
+                            file_list = zip_ref.namelist()
+                            
+                            if not file_list:
+                                # ZIP文件为空
+                                QMessageBox.warning(self, "提取失败", "隐藏的ZIP文件为空!")
+                            else:
+                                # 提取第一个文件
+                                first_file = file_list[0]
+                                extracted_data = zip_ref.read(first_file)
+                                
+                                # 让用户选择保存位置
+                                save_dir = self.save_location.text().strip()
+                                if not save_dir:
+                                    save_dir = self.default_save_path.text() or os.path.dirname(self.current_image_path)
+                                
+                                # 使用原始文件名作为保存文件名
+                                save_filename = original_filename
+                                save_path, _ = QFileDialog.getSaveFileName(
+                                    self, "保存提取的文件", 
+                                    os.path.join(save_dir, save_filename),
+                                    "所有文件 (*.*)"
+                                )
+                                
+                                if save_path:
+                                    with open(save_path, "wb") as extracted_file:
+                                        extracted_file.write(extracted_data)
+                                    
+                                    self.statusBar().showMessage(f"文件已提取到: {save_path}")
+                                    QMessageBox.information(self, "提取成功", f"文件已从ZIP中提取到:\n{save_path}")
+                        
+                        # 删除临时ZIP文件
+                        if temp_zip_path and os.path.exists(temp_zip_path):
+                            os.remove(temp_zip_path)
+                    except Exception as e:
+                        logging.error(f"解压ZIP文件失败: {str(e)}")
+                        QMessageBox.critical(self, "提取失败", f"解压ZIP文件时出错:\n{str(e)}")
+                        # 确保临时文件被删除
+                        if temp_zip_path and os.path.exists(temp_zip_path):
+                            os.remove(temp_zip_path)
+            else:
+                # 如果隐藏的数据不是ZIP格式，则直接保存原文件
+                save_dir = self.save_location.text().strip()
+                if not save_dir:
+                    save_dir = self.default_save_path.text() or os.path.dirname(self.current_image_path)
+
+                save_path, _ = QFileDialog.getSaveFileName(
+                    self, "保存隐藏文件", 
+                    os.path.join(save_dir, original_filename),
+                    "所有文件 (*.*)"
+                )
+            
+                if save_path:
+                    with open(save_path, "wb") as extracted_file:
+                        extracted_file.write(file_data)
+                
+                    self.statusBar().showMessage(f"文件已提取到: {save_path}")
+                    QMessageBox.information(self, "提取成功", f"文件已提取到:\n{save_path}")
+        except Exception as e:
+            logging.error(f"提取文件失败: {str(e)}")
+            QMessageBox.critical(self, "提取失败", f"提取文件时出错:\n{str(e)}")
+    
+    def format_file_size(self, size_bytes):
+        """格式化文件大小显示，自动切换单位"""
+        if size_bytes < 1024:
+            return f"{size_bytes} B"
+        elif size_bytes < 1024 * 1024:
+            return f"{size_bytes / 1024:.2f} KB"
+        elif size_bytes < 1024 * 1024 * 1024:
+            return f"{size_bytes / (1024 * 1024):.2f} MB"
+        else:
+            return f"{size_bytes / (1024 * 1024 * 1024):.2f} GB"
+    
+    def test_stego_image(self):
+        """测试图种文件"""
+        if not self.current_image_path:
+            QMessageBox.warning(self, "无图片", "请先选择一张图片进行测试!")
+            return
+        
+        try:
+            # 读取文件
+            with open(self.current_image_path, "rb") as stego_file:
+                stego_data = stego_file.read()
+            
+            # 检测图片类型
+            try:
+                image = Image.open(io.BytesIO(stego_data))
+                image_type = image.format.lower()
+                image.close()
+            except Exception:
+                QMessageBox.critical(self, "无效图片", "无法识别图片格式!")
+                return
+            
+            # 获取图片大小
+            stego_size = os.path.getsize(self.current_image_path)
+            
+            # 查找图片结束位置
+            if image_type == "png":
+                # PNG文件以IEND块结束
+                iend_pos = stego_data.rfind(b'IEND\xaeB`\x82')
+                if iend_pos == -1:
+                    image_end = stego_size
+                else:
+                    image_end = iend_pos + 8
+            elif image_type == "jpeg":
+                # JPEG文件以FF D9结束
+                jpeg_end = stego_data.rfind(b'\xFF\xD9')
+                if jpeg_end == -1:
+                    image_end = stego_size
+                else:
+                    image_end = jpeg_end + 2
+            else:
+                # 尝试使用文件大小估计
+                try:
+                    img = Image.open(io.BytesIO(stego_data))
+                    img.load()
+                    image_end = len(img.fp.read())
+                except:
+                    image_end = stego_size
+            
+            # 计算隐藏文件大小
+            hidden_size = stego_size - image_end
+            
+            # 获取图片分辨率
+            try:
+                img = Image.open(self.current_image_path)
+                width, height = img.size
+                resolution = f"{width}\u00d7{height}"
+            except:
+                resolution = "未知"
+            
+            # 格式化文件大小显示
+            stego_size_formatted = self.format_file_size(stego_size)
+            image_end_formatted = self.format_file_size(image_end)
+            hidden_size_formatted = self.format_file_size(hidden_size)
+            
+            # 显示信息
+            info = f"""
+图片信息:
+  文件路径: {self.current_image_path}
+  文件大小: {stego_size_formatted} ({stego_size:,} 字节)
+  图片类型: {image_type.upper()}
+  图片分辨率: {resolution}
+  图片数据大小: {image_end_formatted} ({image_end:,} 字节)
+  隐藏文件大小: {hidden_size_formatted} ({hidden_size:,} 字节)
+"""
+            if hidden_size > 0:
+                info += f"""
+提示:
+  此文件包含隐藏数据!
+  请使用本工具的"提取文件"功能获取隐藏内容。
+  或修改文件扩展名为.zip尝试解压。
+"""
+            else:
+                info += "\n未检测到隐藏数据。"
+                
+            QMessageBox.information(self, "图种分析", info)
+        except Exception as e:
+            logging.error(f"测试图种失败: {str(e)}")
+            QMessageBox.critical(self, "测试失败", f"分析图种时出错:\n{str(e)}")
+    
+    # 文件加解密功能
+    def use_current_formatted_key(self):
+        """使用当前生成的格式化密钥"""
+        if self.current_key_info and self.current_key_info.formatted_key:
+            self.sym_key_text.setPlainText(self.current_key_info.formatted_key)
+            self.statusBar().showMessage("当前格式化密钥已加载!")
+        else:
+            QMessageBox.warning(self, "无密钥", "请先生成密钥!")
+    
+    def use_current_pub_key_file(self):
+        """使用当前生成的公钥（文件加解密）"""
+        if self.current_key_info and self.current_key_info.public_key:
+            self.file_pub_key_text.setPlainText(self.current_key_info.public_key)
+            self.statusBar().showMessage("当前公钥已加载!")
+        else:
+            QMessageBox.warning(self, "无公钥", "请先生成密钥对!")
+    
+    def use_current_priv_key_file(self):
+        """使用当前生成的私钥（文件加解密）"""
+        if self.current_key_info and self.current_key_info.private_key:
+            self.file_priv_key_text.setPlainText(self.current_key_info.private_key)
+            self.statusBar().showMessage("当前私钥已加载!")
+        else:
+            QMessageBox.warning(self, "无私钥", "请先生成密钥对!")
+    
+    def browse_encrypt_file(self):
+        """浏览要加密的文件"""
+        options = QFileDialog.Options()
+        file, _ = QFileDialog.getOpenFileName(self, "选择要加密的文件", 
+                                             self.default_save_path.text() or os.path.expanduser("~"),
+                                             "所有文件 (*.*)", 
+                                             options=options)
+        if file:
+            self.encrypt_file_path.setText(file)
+            self.file_crypto_status.setText("文件已选择")
+    
+    def browse_decrypt_file(self):
+        """浏览要解密的文件"""
+        options = QFileDialog.Options()
+        file, _ = QFileDialog.getOpenFileName(self, "选择要解密的文件", 
+                                             self.default_save_path.text() or os.path.expanduser("~"),
+                                             "AKTP文件 (*.aktp);;所有文件 (*.*)", 
+                                             options=options)
+        if file:
+            self.decrypt_file_path.setText(file)
+            self.file_crypto_status.setText("加密文件已选择")
+    
+    def browse_file_save_location(self):
+        """浏览文件保存位置"""
+        options = QFileDialog.Options()
+        save_dir = QFileDialog.getExistingDirectory(self, "选择保存位置", 
+                                                   self.default_save_path.text() or os.path.expanduser("~"), 
+                                                   options=options)
+        if save_dir:
+            self.file_save_location.setText(save_dir)
+    
+    def encrypt_file(self):
+        """加密文件"""
+        file_path = self.encrypt_file_path.text().strip()
+        sym_key = self.sym_key_text.toPlainText().strip()
+        pub_key = self.file_pub_key_text.toPlainText().strip()
+        save_dir = self.file_save_location.text().strip()
+        
+        if not file_path:
+            QMessageBox.warning(self, "无文件", "请先选择要加密的文件!")
+            return
+            
+        if not sym_key:
+            QMessageBox.warning(self, "无密钥", "请输入对称密钥!")
+            return
+            
+        if not pub_key:
+            QMessageBox.warning(self, "无公钥", "请输入公钥!")
+            return
+            
+        # 设置默认保存位置
+        if not save_dir:
+            save_dir = self.default_save_path.text() or os.path.dirname(file_path)
+        
+        try:
+            # 获取原始文件名
+            original_filename = os.path.basename(file_path)
+            filename_bytes = original_filename.encode('utf-8')
+            filename_length = len(filename_bytes)
+            
+            # 准备对称密钥（格式化密钥）
+            # 确保密钥长度为32字节（256位），不足则补0
+            key_bytes = sym_key.encode('utf-8')
+            if len(key_bytes) < 32:
+                key_bytes += b'\0' * (32 - len(key_bytes))
+            elif len(key_bytes) > 32:
+                key_bytes = key_bytes[:32]
+            
+            # 导入公钥
+            rsa_key = RSA.import_key(pub_key)
+            cipher_rsa = PKCS1_OAEP.new(rsa_key)
+            
+            # 加密对称密钥
+            encrypted_key = cipher_rsa.encrypt(key_bytes)
+            
+            # 生成随机IV
+            iv = get_random_bytes(16)
+            
+            # 创建AES加密器
+            cipher_aes = AES.new(key_bytes, AES.MODE_CBC, iv)
+            
+            # 读取文件内容
+            with open(file_path, "rb") as f:
+                file_data = f.read()
+            
+            # 填充数据以满足AES块大小要求
+            pad_len = 16 - (len(file_data) % 16)
+            file_data_padded = file_data + bytes([pad_len] * pad_len)
+            
+            # 加密文件数据
+            encrypted_data = cipher_aes.encrypt(file_data_padded)
+            
+            # 构建加密文件: [加密的密钥(256字节)] + [IV(16字节)] + [文件名长度(4字节)] + [文件名] + [加密的数据]
+            filename_length_bytes = filename_length.to_bytes(4, byteorder='big')
+            encrypted_file = encrypted_key + iv + filename_length_bytes + filename_bytes + encrypted_data
+            
+            # 保存加密文件
+            base_name = os.path.basename(file_path)
+            save_path = os.path.join(save_dir, f"{base_name}.aktp")
+            
+            with open(save_path, "wb") as f:
+                f.write(encrypted_file)
+            
+            self.file_crypto_status.setText(f"文件加密成功: {os.path.basename(save_path)}")
+            self.statusBar().showMessage(f"加密文件已保存到: {save_path}")
+            QMessageBox.information(self, "加密成功", 
+                                  f"文件加密成功!\n保存位置: {save_path}")
+        except Exception as e:
+            logging.error(f"文件加密失败: {str(e)}")
+            QMessageBox.critical(self, "加密失败", f"文件加密时出错:\n{str(e)}")
+    
+    def decrypt_file(self):
+        """解密文件"""
+        file_path = self.decrypt_file_path.text().strip()
+        priv_key = self.file_priv_key_text.toPlainText().strip()
+        save_dir = self.file_save_location.text().strip()
+        
+        if not file_path:
+            QMessageBox.warning(self, "无文件", "请先选择要解密的文件!")
+            return
+            
+        if not priv_key:
+            QMessageBox.warning(self, "无私钥", "请输入私钥!")
+            return
+            
+        # 设置默认保存位置
+        if not save_dir:
+            save_dir = self.default_save_path.text() or os.path.dirname(file_path)
+        
+        try:
+            # 读取加密文件
+            with open(file_path, "rb") as f:
+                encrypted_data = f.read()
+            
+            # 导入私钥以确定加密密钥长度
+            rsa_key = RSA.import_key(priv_key)
+            key_size = rsa_key.size_in_bytes()  # 获取RSA密钥的字节长度
+            
+            # 提取加密的对称密钥和IV
+            encrypted_key = encrypted_data[:key_size]  # 使用实际的密钥长度
+            iv = encrypted_data[key_size:key_size+16]  # IV长度为16字节
+            
+            # 提取文件名信息
+            filename_length_start = key_size + 16
+            filename_length_bytes = encrypted_data[filename_length_start:filename_length_start+4]  # 文件名长度(4字节)
+            if len(filename_length_bytes) < 4:
+                QMessageBox.critical(self, "解密失败", "加密文件信息不完整!")
+                return
+            
+            filename_length = int.from_bytes(filename_length_bytes, byteorder='big')
+            
+            # 检查数据是否足够
+            file_data_start = filename_length_start + 4 + filename_length
+            if len(encrypted_data) < file_data_start:
+                QMessageBox.critical(self, "解密失败", "加密文件信息不完整!")
+                return
+            
+            # 提取文件名
+            filename_bytes = encrypted_data[filename_length_start+4:file_data_start]
+            original_filename = filename_bytes.decode('utf-8')
+            
+            # 提取加密数据
+            file_data_encrypted = encrypted_data[file_data_start:]
+            
+            # 解密对称密钥
+            cipher_rsa = PKCS1_OAEP.new(rsa_key)
+            key_bytes = cipher_rsa.decrypt(encrypted_key)
+            
+            # 创建AES解密器
+            cipher_aes = AES.new(key_bytes, AES.MODE_CBC, iv)
+            
+            # 解密文件数据
+            file_data_padded = cipher_aes.decrypt(file_data_encrypted)
+            
+            # 移除填充
+            pad_len = file_data_padded[-1]
+            file_data = file_data_padded[:-pad_len]
+            
+            # 保存解密文件
+            save_path = os.path.join(save_dir, original_filename)
+            
+            with open(save_path, "wb") as f:
+                f.write(file_data)
+            
+            self.file_crypto_status.setText(f"文件解密成功: {os.path.basename(save_path)}")
+            self.statusBar().showMessage(f"解密文件已保存到: {save_path}")
+            QMessageBox.information(self, "解密成功", 
+                                  f"文件解密成功!\n保存位置: {save_path}")
+        except Exception as e:
+            logging.error(f"文件解密失败: {str(e)}")
+            QMessageBox.critical(self, "解密失败", f"文件解密时出错:\n{str(e)}")
+
+
+def main():
+    """主函数"""
+    # 解析命令行参数
+    parser = argparse.ArgumentParser(description="高级密钥工具")
+    parser.add_argument("-nogui", action="store_true", help="不启动GUI界面")
+    parser.add_argument("-dp", "--drawing-production", action="store_true", help="图种制作模式")
+    
+    # 只在非GUI模式下才解析参数，避免与Qt的参数冲突
+    if len(sys.argv) > 1 and "-nogui" in sys.argv:
+        args = parser.parse_args()
+        
+        # 如果指定了-nogui参数，则不启动GUI
+        if args.nogui:
+            print("在无GUI模式下运行...")
+            # 这里可以添加无GUI模式下的功能实现
+            # 例如：图种制作、密钥生成等
+            if args.drawing_production:
+                print("图种制作模式已启用")
+            return 0
+    
+    # 启动GUI
+    app = QApplication(sys.argv)
+    app.setApplicationName("高级密钥工具")
+    app.setApplicationVersion("3.5")
+    
+    # 设置应用程序图标
+    # app.setWindowIcon(QIcon("icon.png"))  # 如果有图标文件的话
+    
+    window = AdvancedKeyToolsGUI()
+    window.show()
+    
+    # 设置全局样式
+    app.setStyle("Fusion")
+    
+    return app.exec_()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
